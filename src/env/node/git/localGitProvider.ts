@@ -188,7 +188,17 @@ import { countStringLength, filterMap } from '../../../system/array';
 import { gate } from '../../../system/decorators/gate';
 import { debug, log } from '../../../system/decorators/log';
 import { debounce } from '../../../system/function';
-import { filterMap as filterMapIterable, find, first, join, last, map, skip, some } from '../../../system/iterable';
+import {
+	filterMap as filterMapIterable,
+	find,
+	first,
+	join,
+	last,
+	map,
+	min,
+	skip,
+	some,
+} from '../../../system/iterable';
 import { Logger } from '../../../system/logger';
 import type { LogScope } from '../../../system/logger.scope';
 import { getLogScope, setLogScopeExit } from '../../../system/logger.scope';
@@ -2398,7 +2408,7 @@ export class LocalGitProvider implements GitProvider, Disposable {
 		const [refResult, stashResult, branchesResult, remotesResult, currentUserResult, worktreesResult] =
 			await Promise.allSettled([
 				this.git.log(repoPath, undefined, ...refParser.arguments, '-n1', options?.ref ?? 'HEAD'),
-				this.getStash(repoPath),
+				this.getStash(repoPath, { reachableFrom: options?.ref }),
 				this.getBranches(repoPath),
 				this.getRemotes(repoPath),
 				this.getCurrentUser(repoPath),
@@ -3658,11 +3668,11 @@ export class LocalGitProvider implements GitProvider, Disposable {
 			merges?: boolean | 'first-parent';
 			ordering?: 'date' | 'author-date' | 'topo' | null;
 			ref?: string;
-			status?: null | 'name-status' | 'numstat' | 'stat';
 			since?: number | string;
+			stashes?: boolean | Map<string, GitStashCommit>;
+			status?: null | 'name-status' | 'numstat' | 'stat';
 			until?: number | string;
 			extraArgs?: string[];
-			stdin?: string;
 		},
 	): Promise<GitLog | undefined> {
 		const scope = getLogScope();
@@ -3727,48 +3737,43 @@ export class LocalGitProvider implements GitProvider, Disposable {
 				args.push(`-n${limit + 1}`);
 			}
 
+			let ref = options?.ref;
+
+			let stashes: Map<string, GitStashCommit> | undefined;
+			let stdin: string | undefined;
+
+			if (options?.stashes) {
+				if (typeof options.stashes === 'boolean') {
+					// TODO@eamodio this is insanity -- there *HAS* to be a better way to get git log to return stashes
+					const stash = await this.getStash(repoPath, { reachableFrom: options?.ref });
+					stashes = new Map(stash?.commits);
+					if (stash?.commits.size) {
+						stdin = '';
+						for (const commit of stash.commits.values()) {
+							stdin += `${commit.sha.substring(0, 9)}\n`;
+							// Include the stash's 2nd (index files) and 3rd (untracked files) parents
+							for (const p of skip(commit.parents, 1)) {
+								stashes.set(p, commit);
+								stdin += `${p.substring(0, 9)}\n`;
+							}
+						}
+					}
+					ref ??= 'HEAD';
+				} else {
+					stashes = options.stashes;
+					stdin = join(
+						map(stashes.values(), c => c.sha.substring(0, 9)),
+						'\n',
+					);
+					ref ??= 'HEAD';
+				}
+			}
+
 			const data = await this.git.log(
 				repoPath,
-				{ configs: gitLogDefaultConfigsWithFiles, ref: options?.ref, stdin: options?.stdin },
+				{ configs: gitLogDefaultConfigsWithFiles, ref: ref, stdin: stdin },
 				...args,
 			);
-
-			// const parser = GitLogParser.defaultParser;
-
-			// const data = await this.git.log2(repoPath, options?.ref, {
-			// 	...options,
-			// 	// args: parser.arguments,
-			// 	limit: limit,
-			// 	merges: options?.merges == null ? true : options.merges,
-			// 	ordering: options?.ordering ?? configuration.get('advanced.commitOrdering'),
-			// 	similarityThreshold: configuration.get('advanced.similarityThreshold'),
-			// });
-
-			// const commits = [];
-			// const entries = parser.parse(data);
-			// for (const entry of entries) {
-			// 	commits.push(
-			// 		new GitCommit2(
-			// 			repoPath,
-			// 			entry.sha,
-			// 			new GitCommitIdentity(
-			// 				entry.author,
-			// 				entry.authorEmail,
-			// 				new Date((entry.authorDate as any) * 1000),
-			// 			),
-			// 			new GitCommitIdentity(
-			// 				entry.committer,
-			// 				entry.committerEmail,
-			// 				new Date((entry.committerDate as any) * 1000),
-			// 			),
-			// 			entry.message.split('\n', 1)[0],
-			// 			entry.parents.split(' '),
-			// 			entry.message,
-			// 			entry.files.map(f => new GitFileChange(repoPath, f.path, f.status as any, f.originalPath)),
-			// 			[],
-			// 		),
-			// 	);
-			// }
 
 			const log = parseGitLog(
 				this.container,
@@ -3776,12 +3781,12 @@ export class LocalGitProvider implements GitProvider, Disposable {
 				LogType.Log,
 				repoPath,
 				undefined,
-				options?.ref,
+				ref,
 				await this.getCurrentUser(repoPath),
 				limit,
 				false,
 				undefined,
-				undefined,
+				stashes,
 				undefined,
 				hasMoreOverride,
 			);
@@ -4993,7 +4998,7 @@ export class LocalGitProvider implements GitProvider, Disposable {
 
 	@gate()
 	@log()
-	async getStash(repoPath: string | undefined): Promise<GitStash | undefined> {
+	async getStash(repoPath: string | undefined, options?: { reachableFrom?: string }): Promise<GitStash | undefined> {
 		if (repoPath == null) return undefined;
 
 		let stash = this.useCaching ? this._stashesCache.get(repoPath) : undefined;
@@ -5069,6 +5074,27 @@ export class LocalGitProvider implements GitProvider, Disposable {
 
 			if (this.useCaching) {
 				this._stashesCache.set(repoPath, stash ?? null);
+			}
+		}
+
+		// Return only reachable stashes from the given ref
+		if (options?.reachableFrom && stash != null) {
+			const oldestStashDate = new Date(min(stash.commits.values(), c => c.date.getTime())).toISOString();
+
+			const ancestors = await this.git.rev_list(repoPath, options.reachableFrom, { since: oldestStashDate });
+			if (ancestors?.length && (ancestors.length !== 1 || ancestors[0])) {
+				const reachable = new Set(ancestors);
+
+				if (reachable.size) {
+					for (const [sha, commit] of stash.commits) {
+						if (commit.parents.some(p => p === options.reachableFrom || reachable.has(p))) {
+							continue;
+						}
+						stash.commits.delete(sha);
+					}
+				} else {
+					stash.commits.clear();
+				}
 			}
 		}
 
