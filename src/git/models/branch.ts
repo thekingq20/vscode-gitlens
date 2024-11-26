@@ -37,6 +37,7 @@ export type GitBranchStatus =
 
 export interface BranchSortOptions {
 	current?: boolean;
+	groupByType?: boolean;
 	missingUpstream?: boolean;
 	orderBy?: BranchSorting;
 	openedWorktreesByBranch?: Set<string>;
@@ -303,7 +304,7 @@ export function isOfBranchRefType(branch: GitReference | undefined) {
 }
 
 export function sortBranches(branches: GitBranch[], options?: BranchSortOptions) {
-	options = { current: true, orderBy: configuration.get('sortBranchesBy'), ...options };
+	options = { current: true, groupByType: true, orderBy: configuration.get('sortBranchesBy'), ...options };
 
 	switch (options.orderBy) {
 		case 'date:asc':
@@ -316,7 +317,7 @@ export function sortBranches(branches: GitBranch[], options?: BranchSortOptions)
 						  (options.openedWorktreesByBranch.has(b.id) ? -1 : 1)
 						: 0) ||
 					(a.starred ? -1 : 1) - (b.starred ? -1 : 1) ||
-					(b.remote ? -1 : 1) - (a.remote ? -1 : 1) ||
+					(options.groupByType ? (b.remote ? -1 : 1) - (a.remote ? -1 : 1) : 0) ||
 					(a.date == null ? -1 : a.date.getTime()) - (b.date == null ? -1 : b.date.getTime()) ||
 					sortCompare(a.name, b.name),
 			);
@@ -333,7 +334,7 @@ export function sortBranches(branches: GitBranch[], options?: BranchSortOptions)
 					(a.name === 'main' ? -1 : 1) - (b.name === 'main' ? -1 : 1) ||
 					(a.name === 'master' ? -1 : 1) - (b.name === 'master' ? -1 : 1) ||
 					(a.name === 'develop' ? -1 : 1) - (b.name === 'develop' ? -1 : 1) ||
-					(b.remote ? -1 : 1) - (a.remote ? -1 : 1) ||
+					(options.groupByType ? (b.remote ? -1 : 1) - (a.remote ? -1 : 1) : 0) ||
 					sortCompare(a.name, b.name),
 			);
 		case 'name:desc':
@@ -349,7 +350,7 @@ export function sortBranches(branches: GitBranch[], options?: BranchSortOptions)
 					(a.name === 'main' ? -1 : 1) - (b.name === 'main' ? -1 : 1) ||
 					(a.name === 'master' ? -1 : 1) - (b.name === 'master' ? -1 : 1) ||
 					(a.name === 'develop' ? -1 : 1) - (b.name === 'develop' ? -1 : 1) ||
-					(b.remote ? -1 : 1) - (a.remote ? -1 : 1) ||
+					(options.groupByType ? (b.remote ? -1 : 1) - (a.remote ? -1 : 1) : 0) ||
 					sortCompare(b.name, a.name),
 			);
 		case 'date:desc':
@@ -363,7 +364,7 @@ export function sortBranches(branches: GitBranch[], options?: BranchSortOptions)
 						  (options.openedWorktreesByBranch.has(b.id) ? -1 : 1)
 						: 0) ||
 					(a.starred ? -1 : 1) - (b.starred ? -1 : 1) ||
-					(b.remote ? -1 : 1) - (a.remote ? -1 : 1) ||
+					(options.groupByType ? (b.remote ? -1 : 1) - (a.remote ? -1 : 1) : 0) ||
 					(b.date == null ? -1 : b.date.getTime()) - (a.date == null ? -1 : a.date.getTime()) ||
 					sortCompare(b.name, a.name),
 			);
@@ -405,4 +406,16 @@ export async function getLocalBranchByUpstream(
 	}
 
 	return undefined;
+}
+
+export async function getLocalBranchUpstreamNames(branches: PageableResult<GitBranch>): Promise<Set<string>> {
+	const remoteBranches = new Set<string>();
+
+	for await (const branch of branches.values()) {
+		if (!branch.remote && branch.upstream?.name != null) {
+			remoteBranches.add(branch.upstream.name);
+		}
+	}
+
+	return remoteBranches;
 }
